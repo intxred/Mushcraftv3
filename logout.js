@@ -6,3 +6,18 @@ document.getElementById('logoutBtn').addEventListener('click', function(e) {
         window.location.href = "auth/logout.php";
     }
 });
+// Wait for the DOM to load
+document.addEventListener("DOMContentLoaded", function() {
+    // Get buttons by their ID
+    const btnExplore = document.getElementById("btnExplore");
+    const btnLearn = document.getElementById("btnContact");
+
+    // Add click event listeners
+    btnExplore.addEventListener("click", function() {
+        alert("To be added on future versions!");
+    });
+
+    btnLearn.addEventListener("click", function() {
+        alert("To be added on future versions!");
+    });
+});
