@@ -1,0 +1,538 @@
+// Updated Arduino sketch with serial command handling + JSON status broadcasting
+// Requires ArduinoJson library (install via Library Manager)
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include "CO2Sensor.h"
+#include "DHT.h"
+#include <ArduinoJson.h> // <--- install via Library Manager
+
+// Buttons
+#define START_BUTTON 2
+#define STOP_BUTTON 3
+#define MODE_BUTTON 4
+
+// Devices (active LOW relays)
+#define HUMIDIFIER 8
+#define FAN 9
+#define LED 10
+#define EXHAUST 11
+
+// Sensor pins
+#define DHTPIN A0
+#define DHTTYPE DHT22
+
+// LCD and sensors
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+CO2Sensor co2Sensor(A1, 0.99, 100);
+DHT dht(DHTPIN, DHTTYPE);
+
+// Mode & state
+bool manualMode = false;
+bool humOn = false;
+bool fanOn = false;
+bool ledOn = false;
+bool exhaustOn = false;
+
+bool startIgnored = false;
+int startPressCount = 0;
+
+// Button states
+bool lastModeState = HIGH;
+bool lastStartState = HIGH;
+bool lastStopState = HIGH;
+unsigned long lastModePress = 0;
+unsigned long lastStartPress = 0;
+unsigned long lastStopPress = 0;
+const unsigned long BUTTON_DEBOUNCE = 50;
+
+// Sensor variables
+float temperature = NAN;
+float humidity = NAN;
+int co2Value = 0;
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_READ_INTERVAL = 2000;
+
+// Mode switch display
+bool showAutoMessage = false;
+unsigned long modeMessageTime = 0;
+const unsigned long MODE_MESSAGE_DURATION = 2000;
+
+// LCD stability
+unsigned long lastLCDUpdate = 0;
+const unsigned long LCD_UPDATE_INTERVAL = 500; // Update LCD every 500ms max
+
+// Serial handling
+String serialBuffer = "";
+const size_t SERIAL_BUFFER_LIMIT = 200; // protect from overflow
+unsigned long lastStatusSent = 0;
+const unsigned long STATUS_INTERVAL = 1000; // send status every 1 second
+
+// Track last sent JSON to avoid duplicates (optional)
+String lastSentJson = "";
+
+// Helper: reset LCD safely
+void safeLCDInit() {
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  delay(10);
+}
+
+void readSensors() {
+  // Read CO2 using your CO2Sensor library
+  co2Value = co2Sensor.read();  // Read CO2 ppm
+  
+  // Read temperature and humidity using DHT
+  temperature = dht.readTemperature();  // Celsius
+  humidity = dht.readHumidity();
+}
+
+// Update the LCD (kept mostly same)
+void updateLCD() {
+  if (millis() - lastLCDUpdate < LCD_UPDATE_INTERVAL) {
+    return;
+  }
+  lcd.clear();
+  delay(2);
+  
+  if (!manualMode) {
+    if (showAutoMessage && (millis() - modeMessageTime < MODE_MESSAGE_DURATION)) {
+      lcd.setCursor(0, 0);
+      lcd.print("Switched to");
+      lcd.setCursor(0, 1);
+      lcd.print("AUTO MODE");
+    } else {
+      showAutoMessage = false;
+      if (isnan(temperature) || isnan(humidity)) {
+        lcd.setCursor(0, 0);
+        lcd.print("DHT Error       ");
+      } else {
+        lcd.setCursor(0, 0);
+        lcd.print("CO2:");
+        lcd.print(co2Value);
+        lcd.print("ppm  ");
+        lcd.setCursor(0, 1);
+        lcd.print("T:");
+        lcd.print(temperature, 1);
+        lcd.print("C H:");
+        lcd.print(humidity, 1);
+        lcd.print("%");
+      }
+    }
+  } else {
+    lcd.setCursor(0, 0);
+    lcd.print("MANUAL MODE");
+    lcd.setCursor(0, 1);
+    if (exhaustOn) {
+      lcd.print("EXHAUST ON ");
+    } else if (ledOn) {
+      lcd.print("LED ON     ");
+    } else if (humOn && fanOn) {
+      lcd.print("FAN+HUM ON ");
+    } else {
+      lcd.print("ALL OFF    ");
+    }
+  }
+  
+  lastLCDUpdate = millis();
+}
+
+void setOutputs() {
+  digitalWrite(HUMIDIFIER, humOn ? LOW : HIGH);
+  digitalWrite(FAN, fanOn ? LOW : HIGH);
+  digitalWrite(LED, ledOn ? LOW : HIGH);
+  digitalWrite(EXHAUST, exhaustOn ? LOW : HIGH);
+}
+
+// Forward declaration
+void sendStatus(bool force = false);
+
+// Mode and control functions — ensure they call sendStatus when state changes
+void enterAutoMode() {
+  manualMode = false;
+  humOn = false;
+  fanOn = false;
+  ledOn = true;
+  exhaustOn = false;
+  startIgnored = false;
+  startPressCount = 0;
+  setOutputs();
+  readSensors();
+  
+  showAutoMessage = true;
+  modeMessageTime = millis();
+  
+  safeLCDInit();
+  updateLCD();
+  Serial.println(F("/*MODE_CHANGE*/ AUTO")); // debug-friendly marker
+  sendStatus(true);
+}
+
+void enterManualMode() {
+  manualMode = true;
+  humOn = true;
+  fanOn = true;
+  ledOn = false;
+  exhaustOn = false;
+  startIgnored = true;
+  startPressCount = 0;
+  setOutputs();
+  
+  safeLCDInit();
+  updateLCD();
+  Serial.println(F("/*MODE_CHANGE*/ MANUAL"));
+  sendStatus(true);
+}
+
+void manualCycle() {
+  startPressCount++;
+  int cycle = startPressCount % 3;
+  humOn = fanOn = ledOn = exhaustOn = false;
+
+  if (cycle == 1) {
+    humOn = true;
+    fanOn = true;
+  } else if (cycle == 2) {
+    ledOn = true;
+  } else {
+    exhaustOn = true;
+  }
+
+  setOutputs();
+  updateLCD();
+  Serial.print(F("/*MANUAL_CYCLE*/ "));
+  Serial.println(cycle);
+  sendStatus(true);
+}
+
+void handleStopButton() {
+  humOn = fanOn = ledOn = exhaustOn = false;
+  startIgnored = false;
+  startPressCount = 0;
+  setOutputs();
+  safeLCDInit();
+  updateLCD();
+  Serial.println(F("MANUAL: STOP - ALL OFF"));
+  sendStatus(true);
+}
+
+// Utility: map actuator name to bool ref
+bool *getActuatorRef(const String &name) {
+  if (name == "HUMIDIFIER") return &humOn;
+  if (name == "FAN") return &fanOn;
+  if (name == "LED") return &ledOn;
+  if (name == "EXHAUST") return &exhaustOn;
+  return nullptr;
+}
+
+// Build and send JSON status via Serial
+void sendStatus(bool force) {
+  // Create JSON object
+  StaticJsonDocument<256> doc;
+  doc["mode"] = manualMode ? "MANUAL" : "AUTO";
+  doc["co2"] = co2Value;
+  // Guard NaN -> null
+  if (!isnan(temperature)) doc["temp"] = roundf(temperature * 10) / 10.0;
+  else doc["temp"] = nullptr;
+  if (!isnan(humidity)) doc["hum"] = roundf(humidity * 10) / 10.0;
+  else doc["hum"] = nullptr;
+  doc["humidifier"] = humOn ? 1 : 0;
+  doc["fan"] = fanOn ? 1 : 0;
+  doc["led"] = ledOn ? 1 : 0;
+  doc["exhaust"] = exhaustOn ? 1 : 0;
+  doc["uptime_ms"] = millis();
+
+  // Serialize to string
+  String out;
+  serializeJson(doc, out);
+
+  // Avoid re-sending identical JSON too often unless forced
+  if (!force && out.equals(lastSentJson) && (millis() - lastStatusSent < STATUS_INTERVAL)) {
+    return;
+  }
+
+  Serial.println(out);
+  lastSentJson = out;
+  lastStatusSent = millis();
+}
+
+// Called when a valid command arrived from serial
+void processCommand(const String &cmdLine) {
+  String cmd = cmdLine;
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  // Protect too long commands
+  if (cmd.length() > SERIAL_BUFFER_LIMIT) {
+    Serial.println(F("{\"error\":\"command_too_long\"}"));
+    return;
+  }
+
+  // Convert to uppercase for case-insensitive parsing
+  String upper = cmd;
+  upper.toUpperCase();
+
+  // Tokenize by spaces
+  int firstSpace = upper.indexOf(' ');
+  String verb = (firstSpace == -1) ? upper : upper.substring(0, firstSpace);
+  String rest = (firstSpace == -1) ? String("") : cmd.substring(firstSpace + 1); // original case for values if needed
+  String restUpper = (firstSpace == -1) ? String("") : upper.substring(firstSpace + 1);
+
+  if (verb == "GET_STATUS") {
+    sendStatus(true);
+    return;
+  } else if (verb == "PING") {
+    StaticJsonDocument<64> r;
+    r["pong"] = true;
+    String s; serializeJson(r, s);
+    Serial.println(s);
+    return;
+  } else if (verb == "MODE") {
+    // MODE [AUTO|MANUAL] or toggle if no arg
+    if (restUpper.length() == 0) {
+      // toggle
+      if (manualMode) enterAutoMode();
+      else enterManualMode();
+      return;
+    } else {
+      String arg = restUpper;
+      arg.trim();
+      if (arg == "AUTO") {
+        if (manualMode) enterAutoMode();
+        else sendStatus(true); // already in auto
+        return;
+      } else if (arg == "MANUAL") {
+        if (!manualMode) enterManualMode();
+        else sendStatus(true); // already in manual
+        return;
+      } else {
+        StaticJsonDocument<128> e;
+        e["error"] = "invalid_MODE_arg";
+        e["allowed"] = "AUTO or MANUAL";
+        String s; serializeJson(e, s);
+        Serial.println(s);
+        return;
+      }
+    }
+  } else if (verb == "START") {
+    if (manualMode) {
+      manualCycle();
+    } else {
+      StaticJsonDocument<64> e;
+      e["error"] = "START_only_in_MANUAL";
+      String s; serializeJson(e, s);
+      Serial.println(s);
+    }
+    return;
+  } else if (verb == "STOP") {
+    if (manualMode) {
+      handleStopButton();
+    } else {
+      // allow stop to still turn off all actuators in AUTO? we will still perform it
+      humOn = fanOn = ledOn = exhaustOn = false;
+      setOutputs();
+      sendStatus(true);
+    }
+    return;
+  } else if (verb == "SET") {
+    // SET <ACTUATOR> <ON|OFF>
+    // parse restUpper tokens
+    int sp = restUpper.indexOf(' ');
+    if (sp == -1) {
+      StaticJsonDocument<128> e;
+      e["error"] = "SET_usage";
+      e["usage"] = "SET <HUMIDIFIER|FAN|LED|EXHAUST> <ON|OFF>";
+      String s; serializeJson(e, s);
+      Serial.println(s);
+      return;
+    }
+    String act = restUpper.substring(0, sp);
+    String state = restUpper.substring(sp + 1);
+    act.trim(); state.trim();
+
+    bool *actRef = getActuatorRef(act);
+    if (!actRef) {
+      StaticJsonDocument<64> e;
+      e["error"] = "unknown_actuator";
+      String s; serializeJson(e, s);
+      Serial.println(s);
+      return;
+    }
+
+    if (state == "ON") {
+      *actRef = true;
+      setOutputs();
+      sendStatus(true);
+      return;
+    } else if (state == "OFF") {
+      *actRef = false;
+      setOutputs();
+      sendStatus(true);
+      return;
+    } else {
+      StaticJsonDocument<64> e;
+      e["error"] = "invalid_state";
+      e["allowed"] = "ON or OFF";
+      String s; serializeJson(e, s);
+      Serial.println(s);
+      return;
+    }
+  } else {
+    StaticJsonDocument<128> e;
+    e["error"] = "unknown_command";
+    e["received"] = cmd;
+    String s; serializeJson(e, s);
+    Serial.println(s);
+    return;
+  }
+}
+
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    // Accept CR or LF as terminator; treat '\n' as end
+    if (c == '\r') continue;
+    if (c == '\n') {
+      // process buffer
+      processCommand(serialBuffer);
+      serialBuffer = "";
+    } else {
+      // append if not exceeding limit
+      if (serialBuffer.length() < SERIAL_BUFFER_LIMIT) {
+        serialBuffer += c;
+      } else {
+        // buffer overflow protection: clear and send error
+        serialBuffer = "";
+        Serial.println(F("{\"error\":\"serial_buffer_overflow\"}"));
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Starting system initialization...");
+
+  // Initialize buttons
+  pinMode(START_BUTTON, INPUT_PULLUP);
+  pinMode(STOP_BUTTON, INPUT_PULLUP);
+  pinMode(MODE_BUTTON, INPUT_PULLUP);
+
+  // Initialize outputs
+  pinMode(HUMIDIFIER, OUTPUT);
+  pinMode(FAN, OUTPUT);
+  pinMode(LED, OUTPUT);
+  pinMode(EXHAUST, OUTPUT);
+
+  // Initialize all outputs to HIGH (OFF)
+  digitalWrite(HUMIDIFIER, HIGH);
+  digitalWrite(FAN, HIGH);
+  digitalWrite(LED, HIGH);
+  digitalWrite(EXHAUST, HIGH);
+
+  // Initialize LCD with safety
+  safeLCDInit();
+  lcd.setCursor(0, 0);
+  lcd.print("Sensors Init...");
+
+  // Initialize DHT22
+  dht.begin();
+
+  // Calibrate CO2 sensor
+  co2Sensor.calibrate();
+
+  delay(2000);
+
+  // Start in auto mode
+  enterAutoMode();
+
+  lastSensorRead = millis();
+  lastStatusSent = 0;
+
+  Serial.println("System initialization complete");
+  Serial.println("Started in AUTO mode");
+  // send initial status
+  sendStatus(true);
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  // Handle incoming serial
+  handleSerialCommands();
+
+  // MODE button handling
+  bool currentModeState = digitalRead(MODE_BUTTON);
+  if (lastModeState == HIGH && currentModeState == LOW) {
+    if (currentTime - lastModePress > BUTTON_DEBOUNCE) {
+      if (manualMode) {
+        enterAutoMode();
+      } else {
+        enterManualMode();
+      }
+      lastModePress = currentTime;
+    }
+  }
+  lastModeState = currentModeState;
+
+  // Handle auto mode sensor updates
+  if (!manualMode) {
+    if (currentTime - lastSensorRead >= SENSOR_READ_INTERVAL) {
+      readSensors();
+      updateLCD();
+
+      if (isnan(temperature) || isnan(humidity)) {
+        Serial.println(F("{\"error\":\"dht_read_failed\"}"));
+      } else {
+        Serial.print(F("CO2: "));
+        Serial.print(co2Value);
+        Serial.print(F("ppm, Temp: "));
+        Serial.print(temperature);
+        Serial.print(F("C, Hum: "));
+        Serial.print(humidity);
+        Serial.println(F("%"));
+      }
+
+      lastSensorRead = currentTime;
+      // send status after each sensor read
+      sendStatus(true);
+    }
+  }
+
+  // Manual mode controls
+  if (manualMode) {
+    // STOP button handling
+    bool currentStopState = digitalRead(STOP_BUTTON);
+    if (lastStopState == HIGH && currentStopState == LOW) {
+      if (currentTime - lastStopPress > BUTTON_DEBOUNCE) {
+        handleStopButton();
+        lastStopPress = currentTime;
+      }
+    }
+    lastStopState = currentStopState;
+
+    // START button handling
+    bool currentStartState = digitalRead(START_BUTTON);
+    if (!startIgnored && lastStartState == HIGH && currentStartState == LOW) {
+      if (currentTime - lastStartPress > BUTTON_DEBOUNCE) {
+        manualCycle();
+        Serial.println(F("MANUAL: START - cycle devices"));
+        lastStartPress = currentTime;
+      }
+    }
+    lastStartState = currentStartState;
+
+    // Periodic LCD update in manual mode to prevent corruption
+    if (currentTime - lastLCDUpdate >= LCD_UPDATE_INTERVAL) {
+      updateLCD();
+    }
+  }
+
+  // Periodic status broadcast (in case nothing changed)
+  if (currentTime - lastStatusSent >= STATUS_INTERVAL) {
+    sendStatus(false);
+  }
+
+  delay(10);
+}
